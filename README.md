@@ -74,7 +74,7 @@ PlayerName      1000     22.5%   8.3%    31.2%   52.1%    125     150
 
 ## Database Management
 
-- Auto-created on first run
+- Auto-created on first run. db update through 12/7/25 is in the repo.
 - Self-contained SQLite file
 - Compatible with standard SQLite tools
 - Easily backed up by copying file
