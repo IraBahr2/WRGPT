@@ -27,6 +27,8 @@ A Python-based system for collecting, storing, and analyzing poker hand historie
    - Generates statistical reports
    - Provides command-line interface for analysis
 
+6.**Database** (poker_analysis.db)
+
 ## Usage
 
 ### Collecting Hand Histories
