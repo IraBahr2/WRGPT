@@ -1,0 +1,17 @@
+# Ignore everything by default
+*
+
+# But keep these files tracked
+!.gitignore
+!Stats.py
+!average_stats.py
+!db_manager.py
+!hand_collector.py
+!hand_parser.py
+!hand_store.py
+
+# Optional: ignore virtual environments and macOS files anyway
+venv/
+.DS_Store
+
+
