@@ -49,6 +49,8 @@ python stats.py "Player1" "Player2" "Player3"
 # Use custom database location
 python stats.py "Player1" --db custom_database.db
 ```
+### Running Tourney Averages and Leader
+average_stats.py --active-only
 
 ## Available Statistics
 
