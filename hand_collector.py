@@ -1,7 +1,7 @@
 import requests
 from hand_parser import HandParser
 from hand_store import HandStore
-from typing import List, Optional
+from typing import List, Optional, Dict
 import logging
 import time
 from dataclasses import dataclass
@@ -18,13 +18,14 @@ class HandCollector:
         self.parser = HandParser()
         self.store = HandStore()
         self._setup_logging()
-        self.base_url = "http://hands.wrgpt.org/b"
+        
+        # Round info derived from the status page: {'e': {'base_url': '...', 'start_hand': 295}, ...}
+        self.round_info: Dict[str, dict] = {}
         
         # Initialize database
         self.store.db.connect()
         self.store.db.initialize_database()
         self.store.db.close()
-
 
     def _setup_logging(self):
         logging.basicConfig(
@@ -33,13 +34,36 @@ class HandCollector:
         )
         self.logger = logging.getLogger(__name__)
 
-    def _get_table_start_info(self, table_id: str) -> tuple[str, int]:
-        """Determine the base URL and starting hand number based on table ID."""
-        if table_id.startswith('d'):
-            return "http://hands.wrgpt.org/d", 199
-        elif table_id.startswith('c'):
-            return "http://hands.wrgpt.org/c", 120
-        return "http://hands.wrgpt.org/b", 1    
+    def _build_round_info(self, tables: List[TableStatus]) -> None:
+        """Derive base URLs and starting hand numbers from the status page data."""
+        # Group tables by their round prefix (first character of table_id)
+        rounds: Dict[str, List[int]] = {}
+        for table in tables:
+            prefix = table.table_id[0]
+            if prefix not in rounds:
+                rounds[prefix] = []
+            rounds[prefix].append(table.current_hand)
+        
+        # For each round, derive the base URL and starting hand number
+        for prefix, hand_numbers in rounds.items():
+            self.round_info[prefix] = {
+                'base_url': f"http://hands.wrgpt.org/{prefix}",
+                'start_hand': min(hand_numbers)
+            }
+            self.logger.info(
+                f"Round '{prefix}': base_url={self.round_info[prefix]['base_url']}, "
+                f"start_hand={self.round_info[prefix]['start_hand']}"
+            )
+
+    def _get_base_url(self, table_id: str) -> str:
+        """Get the base URL for a table based on its round prefix."""
+        prefix = table_id[0]
+        return self.round_info[prefix]['base_url']
+
+    def _get_start_hand(self, table_id: str) -> int:
+        """Get the starting hand number for a table based on its round prefix."""
+        prefix = table_id[0]
+        return self.round_info[prefix]['start_hand']
 
     def parse_status_page(self) -> List[TableStatus]:
         """Parse the main status page to get all active tables and their hand numbers."""
@@ -70,9 +94,7 @@ class HandCollector:
 
                 status = columns[3].text.strip()  # Fourth column: Status
 
-                # Only add the table if it is not "Broken"
-                if status != "Broken":
-                    tables.append(TableStatus(table_id=table_id, current_hand=hand_num, status=status))
+                tables.append(TableStatus(table_id=table_id, current_hand=hand_num, status=status))
 
             self.logger.info(f"Found {len(tables)} active tables")
             return tables
@@ -86,7 +108,8 @@ class HandCollector:
 
     def fetch_hand(self, table_id: str, hand_number: int) -> Optional[str]:
         """Fetch a single hand history."""
-        url = f"{self.base_url}/hands/{table_id}_{hand_number}.txt"
+        base_url = self._get_base_url(table_id)
+        url = f"{base_url}/hands/{table_id}_{hand_number}.txt"
         try:
             response = requests.get(url)
             response.raise_for_status()
@@ -97,13 +120,23 @@ class HandCollector:
 
     def collect_hands_for_table(self, table_id: str, up_to_hand: int, status: str) -> None:
         """Collect all unprocessed hands for a specific table up to the current hand number."""
-        # Get the correct base URL and starting hand for this table
-        base_url, start_hand = self._get_table_start_info(table_id)
-        self.base_url = base_url
+        start_hand = self._get_start_hand(table_id)
         
         # For finished tables and unknown status, include the last hand (it's complete).
         # For active tables (empty/whitespace status), exclude current hand (it's in progress).
         end_hand = up_to_hand + 1 if status.strip() in ["Finished", "Unk"] else up_to_hand
+        
+        # For "Broken" tables, check if all hands are already processed
+        if status == "Broken":
+            all_processed = True
+            for hand_num in range(start_hand, end_hand):
+                if not self.store.db.is_hand_processed(table_id, hand_num):
+                    all_processed = False
+                    break
+            
+            if all_processed:
+                self.logger.info(f"Skipping {table_id} - all hands already processed")
+                return
         
         self.logger.info(f"Collecting hands for table {table_id} (status: {status}) from hand {start_hand} up to hand {end_hand - 1}")
         
@@ -141,6 +174,13 @@ class HandCollector:
         # Get current table status
         tables = self.parse_status_page()
         total_tables = len(tables)
+        
+        if not tables:
+            self.logger.warning("No tables found on status page")
+            return
+        
+        # Build round info from the status page data
+        self._build_round_info(tables)
         
         self.logger.info(f"Beginning collection for {total_tables} tables")
         

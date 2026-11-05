@@ -25,8 +25,13 @@ class PlayerStats:
     iso_opportunities: int
     iso_attempts: int
     iso_percentage: float
+    bb_defense_opportunities: int
+    bb_defense_count: int
+    bb_defense_percentage: float
     showdown_details: List[tuple] = None
     rfi_details: List[tuple] = None
+    bb_defense_details: List[tuple] = None
+    threeb_hands: List[str] = None
 
 class PokerStatsCalculator:
     def __init__(self, db_path: str = "poker_analysis.db"):
@@ -445,6 +450,97 @@ class PokerStatsCalculator:
                         AND a2.action_type IN ('raise', 'call')
                 )
             GROUP BY p.name, a1.hand_id
+        ),
+        BBDefenseOpportunities AS (
+            -- Hands where player was BB and faced a preflop raise
+            SELECT DISTINCT
+                p.name,
+                hp.hand_id
+            FROM players p
+            JOIN hand_players hp ON p.player_id = hp.player_id
+            JOIN actions a_bb ON hp.hand_id = a_bb.hand_id
+                AND hp.player_id = a_bb.player_id
+                AND a_bb.action_type = 'blind'
+                AND a_bb.street = 'preflop'
+            WHERE p.name IN ({})
+                -- Ensure this is the BB (second blind, i.e. the larger one)
+                AND EXISTS (
+                    SELECT 1
+                    FROM actions a_sb
+                    WHERE a_sb.hand_id = a_bb.hand_id
+                        AND a_sb.action_type = 'blind'
+                        AND a_sb.amount < a_bb.amount
+                )
+                -- Faced a preflop raise
+                AND EXISTS (
+                    SELECT 1
+                    FROM actions a_raise
+                    WHERE a_raise.hand_id = hp.hand_id
+                        AND a_raise.player_id != hp.player_id
+                        AND a_raise.action_type = 'raise'
+                        AND a_raise.street = 'preflop'
+                )
+        ),
+        BBDefenseActions AS (
+            -- Hands where BB actually defended (called or re-raised vs the raise)
+            SELECT DISTINCT
+                p.name,
+                hp.hand_id,
+                hp.cards_shown,
+                hp.net_result,
+                (
+                    SELECT a_def.action_type
+                    FROM actions a_def
+                    WHERE a_def.hand_id = hp.hand_id
+                        AND a_def.player_id = hp.player_id
+                        AND a_def.street = 'preflop'
+                        AND a_def.action_type IN ('call', 'raise')
+                    ORDER BY a_def.sequence_number ASC
+                    LIMIT 1
+                ) as defense_action,
+                (
+                    SELECT a_raise.amount
+                    FROM actions a_raise
+                    WHERE a_raise.hand_id = hp.hand_id
+                        AND a_raise.player_id != hp.player_id
+                        AND a_raise.action_type = 'raise'
+                        AND a_raise.street = 'preflop'
+                    ORDER BY a_raise.sequence_number ASC
+                    LIMIT 1
+                ) as raise_faced
+            FROM players p
+            JOIN hand_players hp ON p.player_id = hp.player_id
+            JOIN actions a_bb ON hp.hand_id = a_bb.hand_id
+                AND hp.player_id = a_bb.player_id
+                AND a_bb.action_type = 'blind'
+                AND a_bb.street = 'preflop'
+            WHERE p.name IN ({})
+                -- Ensure this is the BB
+                AND EXISTS (
+                    SELECT 1
+                    FROM actions a_sb
+                    WHERE a_sb.hand_id = a_bb.hand_id
+                        AND a_sb.action_type = 'blind'
+                        AND a_sb.amount < a_bb.amount
+                )
+                -- Faced a preflop raise
+                AND EXISTS (
+                    SELECT 1
+                    FROM actions a_raise
+                    WHERE a_raise.hand_id = hp.hand_id
+                        AND a_raise.player_id != hp.player_id
+                        AND a_raise.action_type = 'raise'
+                        AND a_raise.street = 'preflop'
+                )
+                -- And defended (called or re-raised)
+                AND EXISTS (
+                    SELECT 1
+                    FROM actions a_def
+                    WHERE a_def.hand_id = hp.hand_id
+                        AND a_def.player_id = hp.player_id
+                        AND a_def.street = 'preflop'
+                        AND a_def.action_type IN ('call', 'raise')
+                )
         )
         SELECT 
             ph.name,
@@ -461,6 +557,8 @@ class PokerStatsCalculator:
             COUNT(DISTINCT st.hand_id) as steal_attempts,
             COUNT(DISTINCT iso_opp.hand_id) as iso_opportunities,
             COUNT(DISTINCT iso.hand_id) as iso_attempts,
+            COUNT(DISTINCT bbd_opp.hand_id) as bb_defense_opportunities,
+            COUNT(DISTINCT bbd.hand_id) as bb_defense_count,
             GROUP_CONCAT(DISTINCT 
                 CASE 
                     WHEN s.hand_id IS NOT NULL 
@@ -476,7 +574,16 @@ class PokerStatsCalculator:
                          COALESCE(rfi.cards_shown, '') || '|' || COALESCE(rfi.amount, '') || '|' ||
                          COALESCE(rfi.net_result, '')
                 END
-            ) as rfi_details
+            ) as rfi_details,
+            GROUP_CONCAT(DISTINCT 
+                CASE 
+                    WHEN bbd.hand_id IS NOT NULL 
+                    THEN bbd.hand_id || '|' || COALESCE(bbd.cards_shown, '') || '|' || 
+                         COALESCE(bbd.defense_action, '') || '|' || COALESCE(bbd.raise_faced, '') || '|' ||
+                         COALESCE(bbd.net_result, '')
+                END
+            ) as bb_defense_details,
+            GROUP_CONCAT(DISTINCT tb.hand_id) as threeb_hands
         FROM PlayerHands ph
         LEFT JOIN VPIPHands v ON ph.name = v.name AND ph.hand_id = v.hand_id
         LEFT JOIN ThreeBetOpportunities tbo ON ph.name = tbo.name AND ph.hand_id = tbo.hand_id
@@ -490,22 +597,26 @@ class PokerStatsCalculator:
         LEFT JOIN StealAttempts st ON ph.name = st.name AND ph.hand_id = st.hand_id
         LEFT JOIN ISOOpportunities iso_opp ON ph.name = iso_opp.name AND ph.hand_id = iso_opp.hand_id
         LEFT JOIN ISOAttempts iso ON ph.name = iso.name AND ph.hand_id = iso.hand_id
+        LEFT JOIN BBDefenseOpportunities bbd_opp ON ph.name = bbd_opp.name AND ph.hand_id = bbd_opp.hand_id
+        LEFT JOIN BBDefenseActions bbd ON ph.name = bbd.name AND ph.hand_id = bbd.hand_id
         GROUP BY ph.name"""
         
         placeholders = ','.join('?' * len(players))
         query = query.format(placeholders, placeholders, placeholders, placeholders, placeholders, 
                            placeholders, placeholders, placeholders, placeholders, placeholders,
-                           placeholders, placeholders)
+                           placeholders, placeholders, placeholders, placeholders)
         
         cursor = self.conn.cursor()
-        cursor.execute(query, players * 12)
+        cursor.execute(query, players * 14)
         
         results = {}
         for row in cursor.fetchall():
             (name, total_hands, vpip_hands, threeb_opportunities, threeb_count, 
              river_hands, showdown_hands, won_hands, rfi_opportunities, rfi_count,
              steal_opportunities, steal_attempts, iso_opportunities, iso_attempts,
-             showdown_details_str, rfi_details_str) = row
+             bb_defense_opportunities, bb_defense_count,
+             showdown_details_str, rfi_details_str, bb_defense_details_str,
+             threeb_hands_str) = row
             
             vpip_percentage = (vpip_hands / total_hands * 100) if total_hands > 0 else 0
             showdown_percentage = (showdown_hands / vpip_hands * 100) if vpip_hands > 0 else 0
@@ -513,6 +624,7 @@ class PokerStatsCalculator:
             w_sd_percentage = (won_hands / showdown_hands * 100) if showdown_hands > 0 else 0
             rfi_percentage = (rfi_count / total_hands * 100) if total_hands > 0 else 0
             iso_percentage = (iso_attempts / iso_opportunities * 100) if iso_opportunities > 0 else 0
+            bb_defense_percentage = (bb_defense_count / bb_defense_opportunities * 100) if bb_defense_opportunities > 0 else 0
 
             # Parse showdown details
             showdown_details = []
@@ -552,6 +664,22 @@ class PokerStatsCalculator:
                         
                         rfi_details.append((hand_id, position, cards, amount, result))
             
+            # Parse BB defense details
+            bb_defense_details = []
+            if bb_defense_details_str:
+                for detail in bb_defense_details_str.split(','):
+                    if detail:
+                        parts = detail.split('|')
+                        hand_id = parts[0]
+                        cards = parts[1] if parts[1] else 'N/A'
+                        defense_action = parts[2] if parts[2] else 'Unknown'
+                        raise_faced = float(parts[3]) if parts[3] else 0.0
+                        result = float(parts[4]) if parts[4] else 0.0
+                        bb_defense_details.append((hand_id, cards, defense_action, raise_faced, result))
+            
+            # Hand IDs where the player made a preflop 3bet
+            threeb_hands = sorted(h for h in threeb_hands_str.split(',') if h) if threeb_hands_str else []
+
             results[name] = PlayerStats(
                 name=name,
                 total_hands=total_hands,
@@ -573,8 +701,13 @@ class PokerStatsCalculator:
                 iso_opportunities=iso_opportunities,
                 iso_attempts=iso_attempts,
                 iso_percentage=round(iso_percentage, 1),
+                bb_defense_opportunities=bb_defense_opportunities,
+                bb_defense_count=bb_defense_count,
+                bb_defense_percentage=round(bb_defense_percentage, 1),
                 showdown_details=showdown_details,
-                rfi_details=rfi_details
+                rfi_details=rfi_details,
+                bb_defense_details=bb_defense_details,
+                threeb_hands=threeb_hands
             )
             
         self.close()
@@ -583,13 +716,14 @@ class PokerStatsCalculator:
 def print_stats(stats: Dict[str, PlayerStats]):
     """Pretty print all statistics including showdown hands and RFI hands."""
     print("\nPlayer Statistics:")
-    print("-" * 130)
-    print(f"{'Player':<16} {'Hands':<8} {'VPIP':<8} {'3Bet':<8} {'RFI':<8} {'ISO':<8} {'Steal':<10} {'WTSD':<8} {'Won@SD':<8} {'ShowDn':<8} {'Rivers':<8}")
-    print("-" * 130)
+    print("-" * 140)
+    print(f"{'Player':<16} {'Hands':<8} {'VPIP':<8} {'3Bet':<8} {'RFI':<8} {'ISO':<8} {'Steal':<10} {'BBDef':<10} {'WTSD':<8} {'Won@SD':<8} {'ShowDn':<8} {'Rivers':<8}")
+    print("-" * 140)
     
     for player_stats in stats.values():
         threeb_display = f"{player_stats.threeb_count}/{player_stats.threeb_opportunities}"
         steal_display = f"{player_stats.steal_attempts}/{player_stats.steal_opportunities}"
+        bbdef_display = f"{player_stats.bb_defense_count}/{player_stats.bb_defense_opportunities}"
         
         print(f"{player_stats.name:<16} "
               f"{player_stats.total_hands:<8} "
@@ -598,6 +732,7 @@ def print_stats(stats: Dict[str, PlayerStats]):
               f"{player_stats.rfi_percentage:<8.1f} "
               f"{player_stats.iso_percentage:<8.1f} "
               f"{steal_display:<10} "
+              f"{bbdef_display:<10} "
               f"{player_stats.wtsd_percentage:<8.1f} "
               f"{player_stats.w_sd_percentage:<8.1f} "
               f"{player_stats.showdown_count:<8} "
@@ -620,6 +755,23 @@ def print_stats(stats: Dict[str, PlayerStats]):
             print("-" * 120)
             for hand_id, cards, board, result in player_stats.showdown_details:
                 print(f"{hand_id:<20} {cards:<15} {board:<30} {result:>10.2f}")
+            print()
+        
+        if player_stats.bb_defense_details:
+            print("BB Defense Hands:")
+            print("-" * 120)
+            print(f"{'Hand ID':<20} {'Cards':<15} {'Action':<12} {'Raise Faced':<15} {'Result':<10}")
+            print("-" * 120)
+            for hand_id, cards, action, raise_faced, result in player_stats.bb_defense_details:
+                action_display = 'Call' if action == 'call' else '3-Bet' if action == 'raise' else action
+                print(f"{hand_id:<20} {cards:<15} {action_display:<12} {raise_faced:>15.2f} {result:>10.2f}")
+            print()
+
+        if player_stats.threeb_hands:
+            print(f"3Bet Hands ({len(player_stats.threeb_hands)}):")
+            print("-" * 120)
+            for hand_id in player_stats.threeb_hands:
+                print(hand_id)
             print()
 
 if __name__ == "__main__":

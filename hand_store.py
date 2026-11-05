@@ -1,5 +1,5 @@
 from db_manager import PokerDBManager
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import logging
 from datetime import datetime
 
@@ -66,17 +66,30 @@ class HandStore:
                         and action.amount is not None]
         return max(blind_amounts) if blind_amounts else None
 
-    def _calculate_net_result(self, player_name: str, hand_data: Dict[str, Any]) -> int:
-        """Calculate net result for a player in this hand."""
-        # Sum up all the player's actions
-        total_action = sum(action.amount for action in hand_data['actions'] 
-                         if action.player == player_name and action.amount is not None)
-        
-        # If player won the pot, add it to their result
-        if player_name == hand_data['winner']:
-            return hand_data['total_pot'] - total_action
-        
-        return -total_action
+    def _calculate_net_result(self, player: Dict[str, Any], ending_stacks: Dict[str, int]) -> Optional[int]:
+        """Calculate a player's true net result for this hand: their ending
+        bankroll (from the second, post-hand player table) minus their true
+        starting stack (this player's Bankroll + Action in the first,
+        pre-resolution table -- Action is what they'd already committed at
+        that snapshot, so adding it back recovers what they had before this
+        hand started).
+
+        This is a pure stack delta, self-contained within this one hand's own
+        two table snapshots -- no carryover from prior hands needed, and no
+        need to separately reason about uncalled bets, split pots, or how
+        many winners a hand had, since those are already reflected in the
+        ending bankroll. Verified zero-sum across all players on real hands,
+        and matches a hand's own stated "(net $X)" exactly where present.
+
+        Returns None if this player's ending stack wasn't found (e.g. a
+        malformed hand missing its second table) rather than guessing.
+        """
+        starting_stack = player['stack'] + player.get('action', 0)
+        ending_stack = ending_stacks.get(player['name'])
+        if ending_stack is None:
+            self.logger.warning(f"No ending stack found for {player['name']!r} -- skipping net_result")
+            return None
+        return ending_stack - starting_stack
 
     def store_hand(self, hand_data: Dict[str, Any]) -> None:
         """Store a complete hand in the database."""
@@ -133,16 +146,17 @@ class HandStore:
 
                 self.logger.info("Storing player hands...")
                 # Only store for players who were at the table and ensure uniqueness
+                ending_stacks = hand_data.get('ending_stacks', {})
                 processed_players = set()
                 for player in hand_data['players']:
                     if player['name'] not in processed_players:
-                        net_result = self._calculate_net_result(player['name'], hand_data)
+                        net_result = self._calculate_net_result(player, ending_stacks)
                         self.logger.info(f"Calculating net result for {player['name']}: {net_result}")
                         self.db.add_hand_player({
                             'hand_id': hand_id,
                             'player_id': player_ids[player['name']],
                             'position': player['seat'],
-                            'starting_stack': player['stack'],
+                            'starting_stack': player['stack'] + player.get('action', 0),
                             'net_result': net_result,
                             'cards_shown': hand_data['shown_hands'].get(player['name'])
                         })
