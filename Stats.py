@@ -32,6 +32,7 @@ class PlayerStats:
     rfi_details: List[tuple] = None
     bb_defense_details: List[tuple] = None
     threeb_hands: List[str] = None
+    allin_raise_count: int = 0
 
 class PokerStatsCalculator:
     def __init__(self, db_path: str = "poker_analysis.db"):
@@ -608,9 +609,22 @@ class PokerStatsCalculator:
         
         cursor = self.conn.cursor()
         cursor.execute(query, players * 14)
-        
+        rows = cursor.fetchall()
+
+        # Number of all-in raises per player (each raise action counts once)
+        cursor.execute(f"""
+            SELECT p.name, COUNT(*)
+            FROM actions a
+            JOIN players p ON a.player_id = p.player_id
+            WHERE p.name IN ({placeholders})
+                AND a.action_type = 'raise'
+                AND a.is_all_in = 1
+            GROUP BY p.name
+        """, players)
+        allin_raise_counts = dict(cursor.fetchall())
+
         results = {}
-        for row in cursor.fetchall():
+        for row in rows:
             (name, total_hands, vpip_hands, threeb_opportunities, threeb_count, 
              river_hands, showdown_hands, won_hands, rfi_opportunities, rfi_count,
              steal_opportunities, steal_attempts, iso_opportunities, iso_attempts,
@@ -707,7 +721,8 @@ class PokerStatsCalculator:
                 showdown_details=showdown_details,
                 rfi_details=rfi_details,
                 bb_defense_details=bb_defense_details,
-                threeb_hands=threeb_hands
+                threeb_hands=threeb_hands,
+                allin_raise_count=allin_raise_counts.get(name, 0)
             )
             
         self.close()
@@ -717,7 +732,7 @@ def print_stats(stats: Dict[str, PlayerStats]):
     """Pretty print all statistics including showdown hands and RFI hands."""
     print("\nPlayer Statistics:")
     print("-" * 140)
-    print(f"{'Player':<16} {'Hands':<8} {'VPIP':<8} {'3Bet':<8} {'RFI':<8} {'ISO':<8} {'Steal':<10} {'BBDef':<10} {'WTSD':<8} {'Won@SD':<8} {'ShowDn':<8} {'Rivers':<8}")
+    print(f"{'Player':<16} {'Hands':<8} {'VPIP':<8} {'3Bet':<8} {'RFI':<8} {'ISO':<8} {'Steal':<10} {'BBDef':<10} {'WTSD':<8} {'Won@SD':<8} {'ShowDn':<8} {'Rivers':<8} {'AI Raise':<8}")
     print("-" * 140)
     
     for player_stats in stats.values():
@@ -736,7 +751,8 @@ def print_stats(stats: Dict[str, PlayerStats]):
               f"{player_stats.wtsd_percentage:<8.1f} "
               f"{player_stats.w_sd_percentage:<8.1f} "
               f"{player_stats.showdown_count:<8} "
-              f"{player_stats.river_reached:<8}")
+              f"{player_stats.river_reached:<8} "
+              f"{player_stats.allin_raise_count:<8}")
         
         if player_stats.rfi_details:
             print("\nRFI Hands:")
